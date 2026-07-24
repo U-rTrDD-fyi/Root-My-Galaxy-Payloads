@@ -444,6 +444,10 @@ static int verify_kernelsu_control(void) {
 }
 
 static int run_s25u_late_load(struct su_request *request, int conn) {
+  const char *ksud_path = request->header.argc >= 3 ? request->argv[2] : S25U_KSUD_PATH;
+  const char *kmi = request->header.argc >= 4 ? request->argv[3] : "android15-6.6";
+  const char *manager_pkg = request->header.argc >= 5 ? request->argv[4] : "me.weishu.kernelsu";
+
   pid_t pid = fork();
   if (pid < 0) {
     return 1;
@@ -464,8 +468,9 @@ static int run_s25u_late_load(struct su_request *request, int conn) {
               strerror(errno));
       _exit(10);
     }
-    if (mount(S25U_KSUD_PATH, LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
-      dprintf(STDERR_FILENO, "late-load: bind mount: %s\n", strerror(errno));
+    if (mount(ksud_path, LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
+      dprintf(STDERR_FILENO, "late-load: bind mount %s: %s\n", ksud_path,
+              strerror(errno));
       _exit(11);
     }
 
@@ -475,8 +480,8 @@ static int run_s25u_late_load(struct su_request *request, int conn) {
       _exit(12);
     }
     if (loader == 0) {
-      execl(LOGCAT_PATH, "logcat", "late-load", "--kmi", "android15-6.6",
-            "--package-name", "me.weishu.kernelsu", (char *)NULL);
+      execl(LOGCAT_PATH, "logcat", "late-load", "--kmi", kmi,
+            "--package-name", manager_pkg, (char *)NULL);
       dprintf(STDERR_FILENO, "late-load: exec: %s\n", strerror(errno));
       _exit(12);
     }
@@ -833,7 +838,7 @@ static void serve_one(int conn) {
     return;
   }
 
-  int is_s25u_late_load = request.header.argc == 2 &&
+  int is_s25u_late_load = request.header.argc >= 2 &&
                            strcmp(request.argv[1], "--late-load") == 0;
   int status = is_s25u_late_load
                    ? run_s25u_late_load(&request, conn)
