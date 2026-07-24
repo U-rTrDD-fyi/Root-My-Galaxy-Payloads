@@ -35,9 +35,12 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 #include "kernelsnitch/utils.h"
+
+void diag_log(const char *fmt, ...);
 
 #define KERNEL_PAGE_SETUP_ATTEMPTS 6
 #if defined(APP_PAYLOAD) && APP_PAYLOAD

@@ -932,6 +932,33 @@ static int payload_runner_main(int argc, char **argv) {
   if (setenv("CVE43499_ROOT_HELPER", argv[3], 1) != 0) {
     return errno;
   }
+
+  {
+    char diag_path[512];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    char *dir = strdup(argv[4]);
+    char *slash = dir ? strrchr(dir, '/') : NULL;
+    if (slash) *slash = '\0';
+    snprintf(diag_path, sizeof(diag_path),
+             "%s/diag-%04d%02d%02d-%02d%02d%02d-%d.log",
+             dir ? dir : "/data/local/tmp",
+             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, (int)getpid());
+    free(dir);
+    int diag_fd = open(diag_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (diag_fd >= 0) {
+      char fd_str[16];
+      snprintf(fd_str, sizeof(fd_str), "%d", diag_fd);
+      setenv("DIAG_LOG_FD", fd_str, 1);
+      setenv("DIAG_LOG_PATH", diag_path, 1);
+      dprintf(diag_fd, "[diag] log opened pid=%d\n", (int)getpid());
+      fsync(diag_fd);
+    }
+  }
+
   dprintf(STDERR_FILENO, "[app] loading verified payload=%s\n", argv[2]);
   void *handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
   if (!handle) {

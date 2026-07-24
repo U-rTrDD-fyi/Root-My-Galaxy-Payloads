@@ -615,7 +615,7 @@ static int slide_child_trigger_write(void) {
 }
 
 static int slide_trigger_physical_state(void) {
-  pr_info("DIAG: slide_trigger_physical_state forking child\n");
+  diag_log("slide_trigger_physical_state forking child\n");
   pid_t child = SYSCHK(fork());
   if (child == 0) {
     SYSCHK(prctl(PR_SET_PDEATHSIG, SIGKILL));
@@ -624,18 +624,17 @@ static int slide_trigger_physical_state(void) {
     }
     disable_rseq_for_thread();
     slide_log_child_context();
-    pr_info("DIAG: child starting slide_child_trigger_write\n");
+    diag_log("child starting slide_child_trigger_write pid=%d\n", getpid());
     int result = slide_child_trigger_write();
-    pr_info("DIAG: child slide_child_trigger_write result=%d\n", result);
+    diag_log("child slide_child_trigger_write result=%d\n", result);
     _exit(result ? 0 : 1);
   }
   int status = 0;
   SYSCHK(waitpid(child, &status, 0));
   int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-  pr_info("DIAG: slide_trigger_physical_state status=%d ok=%d "
-          "exited=%d signal=%d\n",
-          status, ok, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
-          WIFSIGNALED(status) ? WTERMSIG(status) : -1);
+  diag_log("slide_trigger_physical_state status=%d ok=%d exited=%d signal=%d\n",
+           status, ok, WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status) ? WTERMSIG(status) : -1);
   return ok;
 }
 

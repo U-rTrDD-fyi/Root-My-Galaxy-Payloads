@@ -87,85 +87,37 @@ static void wait_for_boot_quiet_window(void) {
 #endif
 }
 
-static void setup_sdcard_log_tee(void) {
-  static const char *log_dirs[] = {
-    "/sdcard/root-logs",
-    "/storage/emulated/0/root-logs",
-    "/data/local/tmp/root-logs",
-  };
-  int sdcard_fd = -1;
-  for (size_t i = 0; i < sizeof(log_dirs) / sizeof(log_dirs[0]); i++) {
-    mkdir(log_dirs[i], 0755);
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm;
-    localtime_r(&ts.tv_sec, &tm);
-    char path[512];
-    snprintf(path, sizeof(path),
-             "%s/run-%04d%02d%02d-%02d%02d%02d-%d.log",
-             log_dirs[i],
-             tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec, getpid());
-    sdcard_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (sdcard_fd >= 0) {
-      dprintf(STDOUT_FILENO, "[tee] logging to %s\n", path);
-      break;
+static int diag_fd = -1;
+
+void diag_log(const char *fmt, ...) {
+  if (diag_fd < 0) {
+    return;
+  }
+  char buf[1024];
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  int prefix = snprintf(buf, sizeof(buf), "[%5ld.%03ld] ",
+                        (long)ts.tv_sec, ts.tv_nsec / 1000000L);
+  va_list ap;
+  va_start(ap, fmt);
+  int body = vsnprintf(buf + prefix, sizeof(buf) - (size_t)prefix, fmt, ap);
+  va_end(ap);
+  if (body > 0) {
+    write(diag_fd, buf, (size_t)(prefix + body));
+    fsync(diag_fd);
+  }
+}
+
+static void setup_diag_log(void) {
+  const char *fd_str = getenv("DIAG_LOG_FD");
+  const char *path = getenv("DIAG_LOG_PATH");
+  if (fd_str) {
+    diag_fd = atoi(fd_str);
+    if (diag_fd >= 0) {
+      diag_log("preload attached pid=%d path=%s\n", getpid(),
+               path ? path : "unknown");
     }
   }
-  if (sdcard_fd < 0) {
-    return;
-  }
-
-  int saved_fd = dup(STDOUT_FILENO);
-  if (saved_fd < 0) {
-    close(sdcard_fd);
-    return;
-  }
-
-  int pipefd[2];
-  if (pipe(pipefd) < 0) {
-    close(sdcard_fd);
-    close(saved_fd);
-    return;
-  }
-
-  pid_t tee_pid = fork();
-  if (tee_pid < 0) {
-    close(pipefd[0]);
-    close(pipefd[1]);
-    close(sdcard_fd);
-    close(saved_fd);
-    return;
-  }
-
-  if (tee_pid == 0) {
-    close(pipefd[1]);
-    prctl(PR_SET_PDEATHSIG, SIGTERM);
-    if (getppid() == 1) {
-      _exit(0);
-    }
-    char buf[4096];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-      write(saved_fd, buf, (size_t)n);
-      write(sdcard_fd, buf, (size_t)n);
-      fsync(sdcard_fd);
-    }
-    close(pipefd[0]);
-    close(saved_fd);
-    fsync(sdcard_fd);
-    close(sdcard_fd);
-    _exit(0);
-  }
-
-  close(pipefd[0]);
-  close(saved_fd);
-  close(sdcard_fd);
-  dup2(pipefd[1], STDOUT_FILENO);
-  dup2(pipefd[1], STDERR_FILENO);
-  close(pipefd[1]);
-  setvbuf(stdout, NULL, _IONBF, 0);
-  setvbuf(stderr, NULL, _IONBF, 0);
 }
 
 __attribute__((constructor)) static void load(void) {
@@ -175,7 +127,7 @@ __attribute__((constructor)) static void load(void) {
   }
   started = 1;
   set_unbuffer();
-  setup_sdcard_log_tee();
+  setup_diag_log();
   wait_for_boot_quiet_window();
 
   int max_attempts = env_int(
