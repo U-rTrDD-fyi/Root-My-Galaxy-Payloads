@@ -64,7 +64,7 @@
       "pageSize": 4096,
       "exploit": {
         "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/main/artifacts/r13s-S731U1UES5AYLX/cve-2026-43499-app.so",
-        "size": 127880
+        "size": 128872
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/main/artifacts/r13s-S731U1UES5AYLX/ksud-samsung-android14-6.1-kdp",

