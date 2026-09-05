@@ -363,6 +363,7 @@ pid_t clone_leak_child(void);
 int open_memfd(pid_t child);
 void kill_child(pid_t child);
 void close_reclaim_sockets(void);
+void close_non_critical_pipes(int keep_index);
 int reclaim_receiver_fd(void);
 void setup_kernelsnitch(void);
 int kernelsnitch_collisions_ready(void);

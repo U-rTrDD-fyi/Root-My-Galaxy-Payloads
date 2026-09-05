@@ -354,6 +354,53 @@ void reset_pipe_attempt(void) {
   atomic_store(&pipe_prepare_done, 0);
 }
 
+void close_non_critical_pipes(int keep_index) {
+  int closed_reclaim = 0, closed_gate = 0, closed_drain = 0;
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    if ((int)i == keep_index) {
+      continue;
+    }
+    if (pipe_fds_reclaim[i][0] >= 0) {
+      close(pipe_fds_reclaim[i][0]);
+      pipe_fds_reclaim[i][0] = -1;
+      closed_reclaim++;
+    }
+    if (pipe_fds_reclaim[i][1] >= 0) {
+      close(pipe_fds_reclaim[i][1]);
+      pipe_fds_reclaim[i][1] = -1;
+      closed_reclaim++;
+    }
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+    if (p0_gate_holders_initialized) {
+      if (p0_gate_holders[i][0] >= 0) {
+        close(p0_gate_holders[i][0]);
+        p0_gate_holders[i][0] = -1;
+        closed_gate++;
+      }
+      if (p0_gate_holders[i][1] >= 0) {
+        close(p0_gate_holders[i][1]);
+        p0_gate_holders[i][1] = -1;
+        closed_gate++;
+      }
+    }
+#endif
+  }
+  for (size_t i = 0; i < PIPE_DRAIN; i++) {
+    if (pipe_fds_drain[i][0] >= 0) {
+      close(pipe_fds_drain[i][0]);
+      pipe_fds_drain[i][0] = -1;
+      closed_drain++;
+    }
+    if (pipe_fds_drain[i][1] >= 0) {
+      close(pipe_fds_drain[i][1]);
+      pipe_fds_drain[i][1] = -1;
+      closed_drain++;
+    }
+  }
+  pr_info("fd-cleanup: closed reclaim=%d gate=%d drain=%d kept_index=%d\n",
+          closed_reclaim, closed_gate, closed_drain, keep_index);
+}
+
 uintptr_t direct_to_page(uintptr_t addr) {
   uintptr_t pfn = (addr - DIRECT_MAP_BASE) >> PAGE_SHIFT;
   return VMEMMAP_START + pfn * STRUCT_PAGE_SIZE;

@@ -201,6 +201,7 @@ static pid_t spawn_allocation_keeper(void) {
   syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
   syscall(SYS_prctl, PR_SET_NAME, "cve43499-hold", 0, 0, 0);
   syscall(SYS_setsid);
+  close_non_critical_pipes(pipebuf_pipe_idx);
 
   int null_fd = (int)syscall(
       SYS_openat, AT_FDCWD, "/dev/null", O_RDWR | O_CLOEXEC, 0);

