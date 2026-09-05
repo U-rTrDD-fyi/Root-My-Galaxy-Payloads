@@ -999,9 +999,26 @@ int try_cfi_stage(void) {
     pid_t diag_child = fork();
     if (diag_child == 0) {
       syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
+      setsid();
+      pid_t grandchild = fork();
+      if (grandchild != 0) {
+        _exit(0);
+      }
+      syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
       syscall(SYS_prctl, PR_SET_NAME, "cve43499-diag", 0, 0, 0);
-      syscall(SYS_setsid);
+      int devnull = open("/dev/null", O_RDWR);
+      if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        if (devnull > STDERR_FILENO) close(devnull);
+      }
 
+      int logfd = open("/data/local/tmp/diag-reboot.log",
+                       O_WRONLY | O_CREAT | O_TRUNC, 0666);
+      if (logfd >= 0) {
+        dup2(logfd, STDOUT_FILENO);
+        dup2(logfd, STDERR_FILENO);
+        if (logfd > STDERR_FILENO) close(logfd);
+      }
       pr_info("diag-reboot: === DIAGNOSTIC BACKGROUND PROCESS pid=%d ===\n",
               getpid());
       pr_info("diag-reboot: waiting 45s for root + KernelSU to fully load...\n");
@@ -1077,8 +1094,10 @@ int try_cfi_stage(void) {
       sleep(30);
       _exit(0);
     }
-    pr_info("diag-reboot: background diagnostic pid=%d — exploit continuing\n",
-            diag_child);
+    if (diag_child > 0) {
+      waitpid(diag_child, NULL, 0);
+    }
+    pr_info("diag-reboot: background diagnostic launched — exploit continuing\n");
   }
 #endif
 
