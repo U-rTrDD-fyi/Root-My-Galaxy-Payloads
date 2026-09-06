@@ -1052,9 +1052,9 @@ static void spawn_p0_ref_keeper(int retained_pipe_index) {
     }
   }
   if (retained_pipe_index < 0) {
-    struct timespec timeout = { .tv_sec = 30, .tv_nsec = 0 };
-    syscall(SYS_nanosleep, &timeout, NULL);
-    _exit(0);
+    for (;;) {
+      pause();
+    }
   }
   int transfer_attempts = 0;
   for (;;) {
