@@ -1056,12 +1056,8 @@ static void spawn_p0_ref_keeper(int retained_pipe_index) {
       pause();
     }
   }
-  int transfer_attempts = 0;
   for (;;) {
     if (transfer_p0_references_to_root(retained_pipe_index)) {
-      _exit(0);
-    }
-    if (++transfer_attempts >= 3000) {
       _exit(0);
     }
     usleep(10000);
