@@ -440,7 +440,7 @@
       ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/testing/artifacts/a36xq-S366VUDS8CZF1/cve-2026-43499-app.so",
-        "size": 68056
+        "size": 68360
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/testing/kernelsu/ksud-S366VUDS8CZF1-kdp",
