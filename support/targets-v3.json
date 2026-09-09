@@ -428,6 +428,24 @@
         "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/testing/kernelsu/ksud-r13s-S731U1UES7BZF3-kdp",
         "size": 3607184
       }
+    },
+    {
+      "payloadId": "a36xq-S366VUDS8CZF1",
+      "displayName": "Galaxy A36 5G (Tracfone) | Kernel 6.6.98",
+      "models": [
+        "SM-S366V"
+      ],
+      "kernelVersions": [
+        "6.6.98"
+      ],
+      "exploit": {
+        "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/testing/artifacts/a36xq-S366VUDS8CZF1/cve-2026-43499-app.so",
+        "size": 68056
+      },
+      "kernelsu": {
+        "url": "https://raw.githubusercontent.com/U-rTrDD-fyi/Root-My-Galaxy-Payloads/testing/kernelsu/ksud-S366VUDS8CZF1-kdp",
+        "size": 4879496
+      }
     }
   ]
 }
